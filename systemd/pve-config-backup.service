@@ -1,0 +1,15 @@
+[Unit]
+Description=Proxmox VE standalone host configuration backup (frozen v1.6)
+After=pve-cluster.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/pve-config-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# No Requires=/BindsTo=/PartOf= coupling to pve-cluster: the tool stops it.
+# Do not force SIGTERM after an arbitrary 15-minute timeout in its stop window.
+TimeoutStartSec=0

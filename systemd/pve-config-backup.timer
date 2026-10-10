@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily standalone Proxmox VE host configuration backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+AccuracySec=1min
+Unit=pve-config-backup.service
+
+[Install]
+WantedBy=timers.target

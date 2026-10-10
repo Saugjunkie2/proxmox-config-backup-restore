@@ -1,0 +1,2162 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+# ============================================================
+# Proxmox VE host configuration backup
+# ============================================================
+#
+# Changelog
+# ------------------------------------------------------------
+# 1.6-B10v2-R2 (ENTWURF, 2026-10-07)
+#   - R2: Ein pmxcfs-Stop gilt nur noch als sauber, wenn pve-cluster wirklich
+#     inactive ist, Result=success meldet, /etc/pve unmounted ist und kein
+#     nicht-zombierter pmxcfs-Prozess mehr existiert. failed/timeout/SIGKILL
+#     darf damit nie das quieszente Snapshot-Fenster freigeben.
+#   - Ein Fehler waehrend der eigentlichen Stop-Transition wird nach vollstaendig
+#     erfolgreicher pmxcfs-Recovery als begrenzter kompletter Snapshotversuch
+#     innerhalb des bestehenden 3-Attempt-Budgets wiederholt. Andere
+#     Mask-/Inspektionsfehler bleiben sofort fail-closed/fatal.
+# 1.6-B10v2-R1 (ENTWURF, 2026-10-07)
+#   - B10v2: pve-cluster wird fuer das quieszente Snapshot-Fenster zuerst
+#     unter der noch normal geladenen Unit gestoppt. Dadurch bleibt der
+#     Unit-spezifische TimeoutStopSec-Vertrag beim Stop erhalten.
+#   - Erst nach nachgewiesen vollstaendigem Stop wird die Runtime-Mask gesetzt;
+#     ein zweiter Full-stop-Proof unter der Maske schliesst das Stop->Mask-Race
+#     fail-closed. SQLite-Sidecar-, Snapshot- und Recovery-Gates bleiben
+#     funktional unveraendert.
+# 1.5 (RELEASE, 2026-10-04)
+#   - B-10 R8: ABA-Haertung. Der bereits verifizierte statische Inhalt des
+#     human-readable /etc/pve-Archivs wird semantisch mit dem persistenten
+#     Baum der quieszenten config.db verglichen. PRE==POST bleibt zusaetzlich.
+#   - Deployment prueft das effektiv geladene Unitmodell zusaetzlich fail-closed
+#     auf BindsTo=/PartOf=-Kopplungen an pve-cluster.service.
+# 1.5-B10-R7 (ENTWURF, 2026-10-04)
+#   - B-10 R7: Guest-State-Parser werten Fehler in awk/xargs explizit
+#     fail-closed aus; kein Verlassen auf set -e in if/||-Aufrufkontexten.
+#   - Deployment/Manual-Rollback koordinieren sich zusaetzlich nonblocking
+#     mit /run/lock/pve-config-restore.lock. Der Produkt-Backupjob selbst
+#     nimmt diesen Restore-Lock bewusst nicht.
+# 1.5-B10-R6 (ENTWURF, 2026-10-04)
+#   - B-10 R6: Der Backup-Kern bleibt funktional unveraendert zu R5.
+#     Der generierte manuelle Rollback-Helper behandelt nun auch den Zustand
+#     "exakte 1.4 + eigener stale R6-Guard" fail-closed und meldet keinen
+#     falschen Erfolg; Guard-Evidence und aktueller Timerzustand bleiben erhalten.
+# 1.5-B10-R5 (ENTWURF, 2026-10-04)
+#   - B-10 R5: Der Backup-Kern bleibt funktional unveraendert zu R4; R5
+#     haertet ausschliesslich Deployment/Recovery gegen parallele Service-Starts,
+#     in-place Live-Dateischreibvorgaenge und Persistent-Timer-Catch-up.
+# 1.5-B10-R4 (ENTWURF, 2026-10-04)
+#   - B-10 R4: Das geschuetzte pmxcfs-Fenster bleibt bis nach erfolgreicher
+#     POST-/etc/pve-Erfassung und einem abschliessenden Health-Gate aktiv.
+#     Fehler in POST-Manifest oder finalem Healthcheck erzwingen Recovery.
+# 1.5-B10-R3 (ENTWURF, 2026-10-04)
+#   - B-10 R3 fail-closed hardening: Corosync broken symlinks werden als
+#     Clusterindikator abgelehnt; pmxcfs-Health und config.db-Quelle werden
+#     unmittelbar vor dem Offlinefenster erneut validiert.
+#   - Runtime-Mask-State wird direkt vor eigener Maskierung erneut geprueft;
+#     mktemp ist Bestandteil des Required-Command-Gates.
+#   - Full-stop-Proof unterscheidet ps-/mountpoint-Inspektionsfehler von
+#     "kein Prozess / nicht gemountet"; SQLite-Sidecar-Symlinks fail-closed.
+# 1.5-B10-R2 (ENTWURF, 2026-10-04)
+#   - B-10 R2 hardening: Guest-Gates werten Fehler von pgrep/qm/pct
+#     fail-closed aus; der Standalone/Corosync-Gate wird unmittelbar vor dem
+#     pmxcfs-Offlinester erneut geprüft.
+#   - Die quieszente Snapshot-Architektur von R1 bleibt ansonsten unverändert.
+# 1.5-B10-R1 (ENTWURF, 2026-10-04)
+#   - B-10: config.db wird nicht mehr per Online-.backup aus einer laufenden
+#     pmxcfs-Rohdatenbank gesichert. Der Recovery-Snapshot wird auf
+#     Standalone-Nodes in einem kurzen, runtime-maskierten pmxcfs-Stopfenster
+#     aus einer quieszenten SQLite-Datenbank erzeugt.
+#   - Vor und nach dem Stopfenster wird der nicht-dynamische /etc/pve-Inhalt
+#     über kanonische Inhaltsmanifeste verglichen. Bei Drift wird der gesamte
+#     pmxcfs-Snapshot begrenzt wiederholt und niemals VERIFIED finalisiert.
+#   - R1 ist fail-closed auf Standalone-Nodes ohne laufende VM/LXC-Gaeste.
+#   - Kann pmxcfs nach einem Fehler nicht wieder gesund gestartet werden,
+#     bleibt das unvollstaendige Arbeitsverzeichnis erhalten und der
+#     Backup-Timer wird fuer manuelle Recovery gestoppt.
+# 1.4 (ENTWURF, 2026-09-25)
+#   - B-01: Signal-Traps für INT/TERM/HUP. Ein Abbruch durch Signal wurde
+#     bisher im EXIT-Trap mit Exit-Code 0 gesehen, das unvollständige
+#     Arbeitsverzeichnis blieb liegen.
+#   - B-02: cleanup läuft mit set +e und ohne ERR-Trap, damit eine
+#     fehlschlagende Meldung die Aufräumschritte nicht abbricht.
+#   - B-03: sqlite3 .backup mit busy_timeout (10 s) statt sofortigem
+#     Abbruch bei "database is locked".
+#   - B-04: tar-Archive werden bei Exit-Code 1 bis zu dreimal neu erstellt.
+#     Dieser Status kann u. a. bei während des Lesens geänderten Dateien
+#     auftreten; Exit-Code >= 2 bleibt fatal.
+#   - B-05: Diagnosebefehle in system-state.txt laufen mit Zeitlimit und
+#     ohne geerbten Lock-Deskriptor.
+#   - B-06: Das lokale Werkzeug /usr/local/sbin/pve-config-restore wird,
+#     falls vorhanden, zusätzlich im Host-Archiv mitgesichert. Der Umfang
+#     wird nicht pauschal auf ganz /usr/local/sbin oder Crontabs erweitert.
+#   - B-07: Daten werden vor dem Umbenennen in den finalen Namen auf den
+#     Datenträger geschrieben (sync -f vor mv).
+#   - B-08: Aufbewahrungshärtung: Die zehn neuesten verifizierten Backups
+#     bleiben unabhängig vom Alter erhalten; verwaiste Arbeitsverzeichnisse
+#     älter als 1 Tag werden entfernt.
+#   - B-09: Versionssprung auf 1.4 und dieses Changelog.
+# 1.3
+#   - Ausgangsstand dieser Überarbeitung (bisher ohne Changelog).
+# ============================================================
+
+SCRIPT_VERSION="1.6"
+BASE="/var/lib/vz/host-config-backups"
+LOCKFILE="/run/lock/pve-config-backup.lock"
+
+# Aufbewahrung: Backups älter als RETENTION_DAYS werden entfernt, die
+# RETENTION_MIN_KEEP neuesten verifizierten Backups aber nie.
+RETENTION_DAYS=30
+RETENTION_MIN_KEEP=10
+
+# Zeitlimit in Sekunden je Diagnosebefehl in system-state.txt.
+DIAG_TIMEOUT=120
+
+# Anzahl Versuche je tar-Archiv, wenn sich Dateien während des Lesens ändern.
+TAR_MAX_ATTEMPTS=3
+
+# B-10: Anzahl kompletter pmxcfs-Snapshotversuche bei erkannter /etc/pve-Drift.
+PMXCFS_SNAPSHOT_MAX_ATTEMPTS=3
+
+# B-10 Laufzeitstatus. Eine Runtime-Mask wird nur entfernt, wenn sie von
+# diesem Prozess selbst gesetzt wurde.
+PVE_CLUSTER_RUNTIME_MASKED_BY_TOOL=0
+PMXCFS_CRITICAL_WINDOW=0
+PMXCFS_RECOVERY_FAILED=0
+PMXCFS_SNAPSHOT_ATTEMPTS_USED=0
+PMXCFS_STOP_RETRYABLE_FAILURE=0
+BACKUP_TIMER="pve-config-backup.timer"
+
+# Werden erst nach den Pre-Flight-Checks gesetzt.
+STAMP=""
+NODE=""
+DEST=""
+TMPDEST=""
+SELF=""
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+die() {
+    echo >&2
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+
+cleanup() {
+    local rc=$?
+
+    # Aufräumen darf nicht an einer fehlschlagenden Ausgabe scheitern
+    # (z. B. geschlossenes Terminal nach SSH-Abbruch).
+    set +e
+    trap - ERR
+    trap '' INT TERM HUP
+
+    # B-10: Wenn ein unerwarteter Fehler im quieszenten pmxcfs-Fenster
+    # auftritt, hat die Wiederherstellung des laufenden pmxcfs Vorrang vor
+    # jedem normalen Backup-Cleanup.
+    if (( rc != 0 && PMXCFS_CRITICAL_WINDOW == 1 )); then
+        echo >&2
+        echo "WARNING: Backup failed while pmxcfs was in the protected snapshot window." >&2
+        echo "Attempting to return pve-cluster to a healthy state..." >&2
+
+        if start_pmxcfs_and_validate; then
+            PMXCFS_CRITICAL_WINDOW=0
+            critical_section_end
+            echo "pve-cluster recovery: OK" >&2
+        else
+            PMXCFS_RECOVERY_FAILED=1
+            systemctl stop "${BACKUP_TIMER}" >/dev/null 2>&1 || true
+            echo "CRITICAL: pve-cluster could not be returned to a healthy state." >&2
+            echo "The automatic backup timer was stopped for safety." >&2
+            echo "Use local/IPMI console and inspect: journalctl -b -u pve-cluster" >&2
+        fi
+    fi
+
+    if (( rc != 0 )); then
+        echo >&2
+        echo "=== BACKUP FAILED ===" >&2
+        echo "Exit code: ${rc}" >&2
+
+        if [[ -n "${TMPDEST:-}" && -d "${TMPDEST}" ]]; then
+            if (( PMXCFS_RECOVERY_FAILED == 1 )); then
+                echo "Preserving incomplete backup for manual recovery diagnostics:" >&2
+                echo "${TMPDEST}" >&2
+            else
+                echo "Removing incomplete backup:" >&2
+                echo "${TMPDEST}" >&2
+                rm -rf -- "${TMPDEST}" || true
+            fi
+        fi
+    fi
+}
+
+
+error_report() {
+    local rc=$?
+
+    echo >&2
+    echo "Command failed." >&2
+    echo "Line: ${BASH_LINENO[0]:-unknown}" >&2
+    echo "Exit code: ${rc}" >&2
+    echo "Command: ${BASH_COMMAND:-unknown}" >&2
+}
+
+
+record_info() {
+    local title="$1"
+    shift
+
+    echo
+    echo "===== ${title} ====="
+
+    # timeout ohne --foreground: Bei Zeitüberschreitung wird die gesamte
+    # Prozessgruppe des Befehls beendet, auch hängende Kindprozesse.
+    # 9>&-: Diagnosebefehle erben den Lock-Deskriptor nicht. Ein hängender
+    # Kindprozess könnte sonst den Backup-Lock über das Skriptende hinaus halten.
+    timeout --kill-after=10 "${DIAG_TIMEOUT}" "$@" 9>&- || {
+        local rc=$?
+
+        echo
+        echo "[WARNING]"
+
+        if (( rc == 124 || rc == 137 )); then
+            echo "Diagnostic command timed out after ${DIAG_TIMEOUT}s:"
+        else
+            echo "Diagnostic command failed with exit code ${rc}:"
+        fi
+
+        printf '%q ' "$@"
+        echo
+    }
+}
+
+
+# Erstellt ein tar.gz-Archiv. GNU tar kann beim Erstellen Exit-Code 1
+# liefern, wenn sich Dateien während des Lesens ändern (z. B. VM-Config mit
+# "lock: backup" während vzdump). Da Status 1 nicht in jedem denkbaren Fall
+# diese Ursache beweist, wird neutral protokolliert und begrenzt wiederholt.
+# Exit-Code >= 2 bleibt sofort fatal.
+create_tar_archive() {
+    local archive="$1"
+    shift
+
+    local attempt=1
+    local rc=0
+
+    while true; do
+        rc=0
+        tar -czf "${archive}" "$@" || rc=$?
+
+        if (( rc == 0 )); then
+            return 0
+        fi
+
+        if (( rc == 1 && attempt < TAR_MAX_ATTEMPTS )); then
+            echo "WARNING: tar returned exit code 1 while creating ${archive##*/} (attempt ${attempt}/${TAR_MAX_ATTEMPTS}); files may have changed while being read. Retrying in 5 seconds..." >&2
+            rm -f -- "${archive}"
+            attempt=$(( attempt + 1 ))
+            sleep 5
+            continue
+        fi
+
+        echo "ERROR: tar failed for ${archive##*/} with exit code ${rc} after ${attempt} attempt(s)." >&2
+        return "${rc}"
+    done
+}
+
+
+unit_active_state() {
+    local state=""
+
+    state="$(systemctl show --property=ActiveState --value "$1" 2>/dev/null)" || state=""
+    printf '%s\n' "${state:-unknown}"
+}
+
+
+pmxcfs_process_running() {
+    local states=""
+    local ps_rc=0
+
+    # GNU ps returns rc=1 when no matching pmxcfs process exists. Any other
+    # inspection error is safety-relevant and must not be treated as "absent".
+    if states="$(ps -C pmxcfs -o stat= 2>/dev/null)"; then
+        :
+    else
+        ps_rc=$?
+        if (( ps_rc != 1 )); then
+            echo "Could not reliably inspect pmxcfs processes (ps rc=${ps_rc})." >&2
+            return 2
+        fi
+    fi
+
+    # Zombie-Einträge halten keine Datenbankdateien mehr offen.
+    awk 'NF && $1 !~ /^Z/ { found = 1 } END { exit(found ? 0 : 1) }' <<< "${states}"
+}
+
+
+pve_cluster_fully_stopped() {
+    local state=""
+    local result=""
+    local mount_rc=0
+    local process_rc=0
+
+    state="$(unit_active_state pve-cluster)"
+    [[ "${state}" == "inactive" ]] || return 1
+
+    result="$(systemctl show --property=Result --value pve-cluster 2>/dev/null)" || result=""
+    [[ "${result}" == "success" ]] || return 1
+
+    if mountpoint -q /etc/pve; then
+        return 1
+    else
+        mount_rc=$?
+    fi
+
+    # util-linux mountpoint uses rc=32 for an existing path that is not a
+    # mountpoint. Other nonzero results are inspection errors -> fail closed.
+    (( mount_rc == 32 )) || return 1
+
+    if pmxcfs_process_running; then
+        return 1
+    else
+        process_rc=$?
+    fi
+
+    # rc=1 means reliably inspected and no non-zombie pmxcfs process found.
+    (( process_rc == 1 )) || return 1
+    return 0
+}
+
+
+pmxcfs_db_source_is_safe() {
+    [[ -f /var/lib/pve-cluster/config.db \
+        && ! -L /var/lib/pve-cluster/config.db \
+        && -r /var/lib/pve-cluster/config.db \
+        && -s /var/lib/pve-cluster/config.db ]]
+}
+
+
+pmxcfs_is_healthy() {
+    systemctl is-active --quiet pve-cluster \
+        && mountpoint -q /etc/pve \
+        && [[ -d "/etc/pve/nodes/${NODE}" ]] \
+        && pmxcfs_process_running
+}
+
+
+critical_section_begin() {
+    # Während pmxcfs absichtlich offline ist, dürfen TERM/HUP/INT keinen
+    # halbfertigen Snapshot hinterlassen. Der EXIT-Cleanup bleibt für echte
+    # Fehler außerhalb dieses Signalwegs zuständig.
+    trap '' INT TERM HUP
+}
+
+
+critical_section_end() {
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+}
+
+
+mask_pve_cluster_runtime_for_snapshot() {
+    local mask_state=""
+
+    PMXCFS_STOP_RETRYABLE_FAILURE=0
+
+    if (( PVE_CLUSTER_RUNTIME_MASKED_BY_TOOL == 0 )); then
+        mask_state="$(systemctl is-enabled pve-cluster 2>/dev/null || true)"
+        [[ -n "${mask_state}" ]] || {
+            echo "Could not determine pve-cluster mask state before snapshot." >&2
+            return 1
+        }
+        if [[ "${mask_state}" == masked* ]]; then
+            echo "pve-cluster became masked before B-10 could establish mask ownership (${mask_state}); refusing snapshot." >&2
+            return 1
+        fi
+
+        # B10v2: Stop before applying the runtime mask so systemd performs the
+        # stop while the original loaded pve-cluster unit semantics, including
+        # its unit-specific TimeoutStopSec, are still in effect.
+        if ! systemctl stop pve-cluster >/dev/null 2>&1; then
+            PMXCFS_STOP_RETRYABLE_FAILURE=1
+            return 1
+        fi
+
+        # R2: prove a CLEAN stop, not merely physical process/mount absence.
+        # A failed/timeout/SIGKILL unit state must never release the snapshot.
+        if ! pve_cluster_fully_stopped; then
+            PMXCFS_STOP_RETRYABLE_FAILURE=1
+            return 1
+        fi
+
+        systemctl mask --runtime pve-cluster >/dev/null 2>&1 || return 1
+        PVE_CLUSTER_RUNTIME_MASKED_BY_TOOL=1
+    fi
+
+    mask_state="$(systemctl is-enabled pve-cluster 2>/dev/null || true)"
+    [[ "${mask_state}" == "masked-runtime" ]] || return 1
+
+    # A start could race between the first full-stop proof and mask completion.
+    # Do not issue a second stop under the masked unit model: prove instead that
+    # the service/process/mount are still fully stopped. Any raced start aborts
+    # the snapshot and is recovered by the existing caller path.
+    pve_cluster_fully_stopped
+}
+
+
+unmask_pve_cluster_runtime_for_start() {
+    if (( PVE_CLUSTER_RUNTIME_MASKED_BY_TOOL == 1 )); then
+        systemctl unmask --runtime pve-cluster >/dev/null 2>&1 || return 1
+        PVE_CLUSTER_RUNTIME_MASKED_BY_TOOL=0
+    fi
+
+    return 0
+}
+
+
+start_pmxcfs_and_validate() {
+    local i=0
+
+    unmask_pve_cluster_runtime_for_start || return 1
+    systemctl reset-failed pve-cluster >/dev/null 2>&1 || true
+    systemctl start pve-cluster >/dev/null 2>&1 || return 1
+
+    for i in {1..10}; do
+        if pmxcfs_is_healthy; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+
+assert_no_running_guest_processes() {
+    local process_file=""
+    local pgrep_rc=0
+
+    process_file="$(mktemp /run/pve-config-backup.guests.XXXXXX)" || return 1
+
+    if pgrep -fa '(/usr/bin/kvm|qemu-system-|lxc-start)' > "${process_file}" 2>/dev/null; then
+        echo "B-10 R8 refuses the quiescent pmxcfs snapshot while guest processes are running:" >&2
+        cat "${process_file}" >&2
+        rm -f -- "${process_file}"
+        return 1
+    else
+        pgrep_rc=$?
+    fi
+    rm -f -- "${process_file}"
+
+    if (( pgrep_rc != 1 )); then
+        echo "B-10 R8 could not reliably inspect guest processes (pgrep rc=${pgrep_rc}); refusing quiescent snapshot." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+
+assert_no_running_guests() {
+    local qm_rc=0
+    local pct_rc=0
+    local qm_parse_rc=0
+    local pct_parse_rc=0
+    local qm_output=""
+    local pct_output=""
+    local running_qm=""
+    local running_pct=""
+
+    assert_no_running_guest_processes || return 1
+
+    if qm_output="$(qm list 2>/dev/null)"; then
+        :
+    else
+        qm_rc=$?
+        echo "B-10 R8 could not query QEMU guest state (qm list rc=${qm_rc}); refusing quiescent snapshot." >&2
+        return 1
+    fi
+
+    if pct_output="$(pct list 2>/dev/null)"; then
+        :
+    else
+        pct_rc=$?
+        echo "B-10 R8 could not query LXC guest state (pct list rc=${pct_rc}); refusing quiescent snapshot." >&2
+        return 1
+    fi
+
+    if running_qm="$(awk 'NR > 1 && $3 == "running" {print $1}' <<< "${qm_output}" | xargs)"; then
+        :
+    else
+        qm_parse_rc=$?
+        echo "B-10 R8 could not reliably parse QEMU guest state (parser rc=${qm_parse_rc}); refusing quiescent snapshot." >&2
+        return 1
+    fi
+
+    if running_pct="$(awk 'NR > 1 && $2 == "running" {print $1}' <<< "${pct_output}" | xargs)"; then
+        :
+    else
+        pct_parse_rc=$?
+        echo "B-10 R8 could not reliably parse LXC guest state (parser rc=${pct_parse_rc}); refusing quiescent snapshot." >&2
+        return 1
+    fi
+
+    if [[ -n "${running_qm}" || -n "${running_pct}" ]]; then
+        echo "B-10 R8 refuses the quiescent pmxcfs snapshot while guests are running." >&2
+        [[ -n "${running_qm}" ]] && echo "Running VMs: ${running_qm}" >&2
+        [[ -n "${running_pct}" ]] && echo "Running containers: ${running_pct}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+assert_standalone_node() {
+    if [[ -e /etc/corosync/corosync.conf || -L /etc/corosync/corosync.conf \
+        || -e /etc/pve/corosync.conf || -L /etc/pve/corosync.conf ]]; then
+        echo "B-10 R8 quiescent pmxcfs snapshot is restricted to standalone nodes." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+pmxcfs_manifest_path_excluded() {
+    local path="$1"
+
+    case "${path}" in
+        etc/pve/.clusterlog|\
+        etc/pve/.members|\
+        etc/pve/.version|\
+        etc/pve/.vmlist|\
+        etc/pve/.rrd|\
+        etc/pve/.rrd/*|\
+        etc/pve/priv/lock|\
+        etc/pve/priv/lock/*|\
+        etc/pve/nodes/*/lrm_status|\
+        etc/pve/ha/manager_status|\
+        etc/pve/ha/crm_commands)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
+pmxcfs_manifest_from_tree() {
+    local root="$1"
+    local output="$2"
+    local list="${output}.list.${BASHPID}"
+    local tmp="${output}.tmp.${BASHPID}"
+    local path=""
+    local rel=""
+    local canonical=""
+    local hash=""
+    local target=""
+
+    rm -f -- "${list}" "${tmp}"
+
+    if ! find "${root}" -xdev -print0 | sort -z > "${list}"; then
+        rm -f -- "${list}" "${tmp}"
+        return 1
+    fi
+
+    : > "${tmp}" || {
+        rm -f -- "${list}" "${tmp}"
+        return 1
+    }
+
+    while IFS= read -r -d '' path; do
+        rel="${path#"${root}"}"
+        canonical="etc/pve${rel}"
+
+        if pmxcfs_manifest_path_excluded "${canonical}"; then
+            continue
+        fi
+
+        if [[ -L "${path}" ]]; then
+            target="$(readlink -- "${path}")" || {
+                rm -f -- "${list}" "${tmp}"
+                return 1
+            }
+            printf 'L\0%s\0%s\0' "${canonical}" "${target}" >> "${tmp}" || return 1
+        elif [[ -d "${path}" ]]; then
+            printf 'D\0%s\0' "${canonical}" >> "${tmp}" || return 1
+        elif [[ -f "${path}" ]]; then
+            hash="$(sha256sum -- "${path}" | awk '{print $1}')" || {
+                rm -f -- "${list}" "${tmp}"
+                return 1
+            }
+            printf 'F\0%s\0%s\0' "${canonical}" "${hash}" >> "${tmp}" || return 1
+        else
+            echo "Unsupported pmxcfs object type in snapshot: ${canonical}" >&2
+            rm -f -- "${list}" "${tmp}"
+            return 1
+        fi
+    done < "${list}"
+
+    rm -f -- "${list}"
+    mv -f -- "${tmp}" "${output}" || return 1
+    chmod 600 "${output}" || return 1
+    return 0
+}
+
+
+pmxcfs_manifest_from_archive() {
+    local archive="$1"
+    local output="$2"
+    local check_dir=""
+    local rc=0
+
+    check_dir="$(mktemp -d /run/pve-config-backup.pmxcfs-archive.XXXXXX)" || return 1
+    chmod 700 "${check_dir}" || {
+        rm -rf -- "${check_dir}"
+        return 1
+    }
+
+    tar -xzf "${archive}" -C "${check_dir}" || rc=$?
+
+    if (( rc == 0 )); then
+        [[ -d "${check_dir}/etc/pve" ]] || rc=1
+    fi
+
+    if (( rc == 0 )); then
+        pmxcfs_manifest_from_tree "${check_dir}/etc/pve" "${output}" || rc=$?
+    fi
+
+    rm -rf -- "${check_dir}" || rc=1
+    return "${rc}"
+}
+
+pmxcfs_persistent_manifest() {
+    local mode="$1"
+    local source="$2"
+    local output="$3"
+
+    rm -f -- "${output}"
+
+    python3 - "${mode}" "${source}" "${output}" <<'PY_PMX'
+import hashlib
+import os
+import re
+import sqlite3
+import sys
+
+mode, source, output = sys.argv[1:4]
+ROOT = 'etc/pve'
+VIRTUAL_NONPERSISTENT = {
+    'etc/pve/.debug',
+}
+GENERATED_LINKS = {
+    'etc/pve/local',
+    'etc/pve/qemu-server',
+    'etc/pve/lxc',
+    'etc/pve/openvz',
+}
+
+def dynamic_path(path):
+    if path == 'etc/pve/priv/lock' or path.startswith('etc/pve/priv/lock/'):
+        return True
+    if path in {'etc/pve/ha/manager_status', 'etc/pve/ha/crm_commands'}:
+        return True
+    if re.fullmatch(r'etc/pve/nodes/[^/]+/lrm_status', path):
+        return True
+    return False
+
+def emit(entries):
+    entries.sort(key=lambda item: item[1].encode('utf-8'))
+    seen = set()
+    data = bytearray()
+    for kind, path, value in entries:
+        if path in seen:
+            raise ValueError(f'duplicate canonical path: {path}')
+        seen.add(path)
+        pb = path.encode('utf-8')
+        if kind == 'D':
+            data += b'D\0' + pb + b'\0'
+        elif kind == 'F':
+            data += b'F\0' + pb + b'\0' + value.encode('ascii') + b'\0'
+        else:
+            raise ValueError(f'unsupported persistent manifest type: {kind}')
+    tmp = output + f'.tmp.{os.getpid()}'
+    with open(tmp, 'wb') as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, output)
+
+def from_tree_manifest(path):
+    raw = open(path, 'rb').read()
+    parts = raw.split(b'\0')
+    if not parts or parts[-1] != b'':
+        raise ValueError('tree manifest is not NUL terminated')
+    parts.pop()
+    i = 0
+    entries = []
+    while i < len(parts):
+        try:
+            kind = parts[i].decode('ascii'); i += 1
+            p = parts[i].decode('utf-8'); i += 1
+        except (UnicodeDecodeError, IndexError) as exc:
+            raise ValueError('invalid tree manifest record') from exc
+        if p != ROOT and not p.startswith(ROOT + '/'):
+            raise ValueError(f'path escapes canonical pmxcfs root: {p}')
+        if kind == 'D':
+            value = None
+        elif kind in ('F', 'L'):
+            if i >= len(parts):
+                raise ValueError('truncated tree manifest record')
+            try:
+                value = parts[i].decode('utf-8' if kind == 'L' else 'ascii')
+            except UnicodeDecodeError as exc:
+                raise ValueError('invalid tree manifest value encoding') from exc
+            i += 1
+        else:
+            raise ValueError(f'unsupported tree manifest record type: {kind}')
+
+        if dynamic_path(p) or p in VIRTUAL_NONPERSISTENT:
+            continue
+        if kind == 'L':
+            if p in GENERATED_LINKS:
+                continue
+            raise ValueError(f'unexpected non-persistent symlink in static manifest: {p}')
+        if kind == 'F':
+            if not re.fullmatch(r'[0-9a-f]{64}', value or ''):
+                raise ValueError(f'invalid file digest in tree manifest: {p}')
+            entries.append(('F', p, value))
+        else:
+            entries.append(('D', p, None))
+    emit(entries)
+
+def from_db(path):
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise ValueError('database source is not a safe regular file')
+    db = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
+    try:
+        db.execute('PRAGMA query_only=ON')
+        columns = [row[1] for row in db.execute('PRAGMA table_info(tree)')]
+        expected = ['inode', 'parent', 'version', 'writer', 'mtime', 'type', 'name', 'data']
+        if columns != expected:
+            raise ValueError(f'unexpected pmxcfs tree schema: {columns!r}')
+        rows = list(db.execute('SELECT inode, parent, type, name, data FROM tree ORDER BY inode'))
+    finally:
+        db.close()
+
+    root_rows = [r for r in rows if r[0] == 0]
+    if len(root_rows) != 1:
+        raise ValueError('pmxcfs DB must contain exactly one inode-0 version row')
+    rr = root_rows[0]
+    if rr[1] != 0 or rr[2] != 8 or rr[3] != '__version__':
+        raise ValueError('unexpected inode-0 pmxcfs version row')
+
+    by_inode = {}
+    for inode, parent, typ, name, data in rows:
+        if inode == 0:
+            continue
+        if not isinstance(inode, int) or inode <= 0 or not isinstance(parent, int) or parent < 0:
+            raise ValueError('invalid inode/parent value')
+        if typ not in (4, 8):
+            raise ValueError(f'unsupported persistent pmxcfs object type {typ} at inode {inode}')
+        if not isinstance(name, str) or not name or name in ('.', '..') or '/' in name or '\x00' in name:
+            raise ValueError(f'invalid pmxcfs object name at inode {inode}')
+        if inode in by_inode:
+            raise ValueError(f'duplicate inode {inode}')
+        by_inode[inode] = (parent, typ, name, data)
+
+    cache = {}
+    visiting = set()
+    def path_for(inode):
+        if inode in cache:
+            return cache[inode]
+        if inode in visiting:
+            raise ValueError('cycle in pmxcfs parent graph')
+        visiting.add(inode)
+        parent, typ, name, data = by_inode[inode]
+        if parent == 0:
+            p = ROOT + '/' + name
+        else:
+            if parent not in by_inode:
+                raise ValueError(f'missing parent inode {parent} for inode {inode}')
+            if by_inode[parent][1] != 4:
+                raise ValueError(f'non-directory parent inode {parent} for inode {inode}')
+            p = path_for(parent) + '/' + name
+        visiting.remove(inode)
+        cache[inode] = p
+        return p
+
+    entries = [('D', ROOT, None)]
+    paths = {ROOT}
+    for inode in sorted(by_inode):
+        parent, typ, name, data = by_inode[inode]
+        p = path_for(inode)
+        if p in paths:
+            raise ValueError(f'duplicate reconstructed path: {p}')
+        paths.add(p)
+        if dynamic_path(p):
+            continue
+        if typ == 4:
+            if data not in (None, b''):
+                raise ValueError(f'directory contains persistent data: {p}')
+            entries.append(('D', p, None))
+        else:
+            if data is None:
+                payload = b''
+            elif isinstance(data, bytes):
+                payload = data
+            else:
+                raise ValueError(f'non-BLOB file payload: {p}')
+            entries.append(('F', p, hashlib.sha256(payload).hexdigest()))
+
+    if len(cache) != len(by_inode):
+        raise ValueError('not all pmxcfs rows are reachable from root')
+    emit(entries)
+
+try:
+    if mode == 'tree-manifest':
+        from_tree_manifest(source)
+    elif mode == 'db':
+        from_db(source)
+    else:
+        raise ValueError(f'unknown persistent-manifest mode: {mode}')
+except Exception as exc:
+    try:
+        os.unlink(output)
+    except FileNotFoundError:
+        pass
+    print(f'pmxcfs persistent manifest error: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY_PMX
+
+    [[ -f "${output}" && ! -L "${output}" ]] || return 1
+    chmod 600 "${output}" || return 1
+    return 0
+}
+
+
+create_stable_pmxcfs_archive() {
+    local archive="$1"
+    local stable_manifest="$2"
+    local attempt=1
+    local before="${TMPDEST}/.pmxcfs-pre-before.manifest"
+    local after="${TMPDEST}/.pmxcfs-pre-after.manifest"
+    local archived="${TMPDEST}/.pmxcfs-pre-archive.manifest"
+
+    while (( attempt <= PMXCFS_SNAPSHOT_MAX_ATTEMPTS )); do
+        rm -f -- "${archive}" "${before}" "${after}" "${archived}" "${stable_manifest}"
+
+        pmxcfs_manifest_from_tree /etc/pve "${before}" || return 1
+
+        create_tar_archive \
+            "${archive}" \
+            --numeric-owner \
+            --exclude='etc/pve/.clusterlog' \
+            --exclude='etc/pve/.members' \
+            --exclude='etc/pve/.rrd' \
+            --exclude='etc/pve/.version' \
+            --exclude='etc/pve/.vmlist' \
+            --exclude='etc/pve/priv/lock' \
+            --exclude='etc/pve/priv/lock/*' \
+            --exclude='etc/pve/nodes/*/lrm_status' \
+            --exclude='etc/pve/ha/manager_status' \
+            --exclude='etc/pve/ha/crm_commands' \
+            -C / \
+            etc/pve || return 1
+
+        pmxcfs_manifest_from_tree /etc/pve "${after}" || return 1
+        pmxcfs_manifest_from_archive "${archive}" "${archived}" || return 1
+
+        if cmp -s "${before}" "${after}" && cmp -s "${after}" "${archived}"; then
+            mv -f -- "${after}" "${stable_manifest}" || return 1
+            rm -f -- "${before}" "${archived}"
+            chmod 600 "${archive}" "${stable_manifest}" || return 1
+            return 0
+        fi
+
+        echo "WARNING: /etc/pve changed while the human-readable pmxcfs archive was captured (attempt ${attempt}/${PMXCFS_SNAPSHOT_MAX_ATTEMPTS}). Retrying..." >&2
+        rm -f -- "${archive}" "${before}" "${after}" "${archived}" "${stable_manifest}"
+        attempt=$(( attempt + 1 ))
+        (( attempt <= PMXCFS_SNAPSHOT_MAX_ATTEMPTS )) && sleep 2
+    done
+
+    echo "ERROR: Could not capture a stable /etc/pve archive." >&2
+    return 1
+}
+
+
+recover_pmxcfs_after_snapshot_failure() {
+    if start_pmxcfs_and_validate; then
+        PMXCFS_CRITICAL_WINDOW=0
+        critical_section_end
+        return 0
+    fi
+
+    echo "pmxcfs recovery attempt failed; EXIT cleanup will retry before declaring CRITICAL." >&2
+    return 1
+}
+
+
+create_quiescent_pmxcfs_snapshot() {
+    local attempt=1
+    local pre_manifest="${TMPDEST}/.pmxcfs-pre.manifest"
+    local post_manifest="${TMPDEST}/.pmxcfs-post.manifest"
+    local pre_persistent_manifest="${TMPDEST}/.pmxcfs-pre-persistent.manifest"
+    local db_persistent_manifest="${TMPDEST}/.pmxcfs-db-persistent.manifest"
+    local snapshot_persistent_manifest="${TMPDEST}/.pmxcfs-snapshot-persistent.manifest"
+    local sidecar=""
+    local sqlite_result=""
+
+    while (( attempt <= PMXCFS_SNAPSHOT_MAX_ATTEMPTS )); do
+        PMXCFS_SNAPSHOT_ATTEMPTS_USED="${attempt}"
+        echo "pmxcfs snapshot attempt ${attempt}/${PMXCFS_SNAPSHOT_MAX_ATTEMPTS}..."
+
+        rm -f -- "${TMPDEST}/config.db" "${TMPDEST}/etc-pve.tar.gz" \
+            "${pre_manifest}" "${post_manifest}" "${pre_persistent_manifest}" \
+            "${db_persistent_manifest}" "${snapshot_persistent_manifest}"
+
+        create_stable_pmxcfs_archive "${TMPDEST}/etc-pve.tar.gz" "${pre_manifest}" \
+            || return 1
+
+        # B-10 R8 ABA invariant: derive the persistent static content represented
+        # by the already-stable human-readable archive. Virtual pmxcfs files,
+        # generated root symlinks and explicitly dynamic persistent status paths
+        # are excluded by a fail-closed canonicalizer.
+        if ! pmxcfs_persistent_manifest tree-manifest "${pre_manifest}" "${pre_persistent_manifest}"; then
+            echo "Could not derive the persistent static manifest from the stable /etc/pve archive." >&2
+            return 1
+        fi
+
+        assert_no_running_guests || return 1
+        assert_standalone_node || return 1
+
+        # B-10 R8: prove immediately before the controlled offline transition
+        # that pmxcfs is still healthy and the raw recovery DB is a safe source.
+        if ! pmxcfs_is_healthy; then
+            echo "pmxcfs is no longer healthy immediately before the protected snapshot window." >&2
+            return 1
+        fi
+        if ! pmxcfs_db_source_is_safe; then
+            echo "pmxcfs config.db is not a safe readable regular source immediately before the protected snapshot window." >&2
+            return 1
+        fi
+
+        PMXCFS_CRITICAL_WINDOW=1
+        critical_section_begin
+
+        if ! mask_pve_cluster_runtime_for_snapshot; then
+            echo "Could not establish the protected stopped pmxcfs state." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+
+            if (( PMXCFS_STOP_RETRYABLE_FAILURE == 1 && attempt < PMXCFS_SNAPSHOT_MAX_ATTEMPTS )); then
+                echo "WARNING: pmxcfs stop transition was not clean (attempt ${attempt}/${PMXCFS_SNAPSHOT_MAX_ATTEMPTS}). Recovery succeeded; retrying the complete pmxcfs snapshot..." >&2
+                rm -f -- "${TMPDEST}/config.db" "${TMPDEST}/etc-pve.tar.gz" \
+                    "${pre_manifest}" "${post_manifest}" "${pre_persistent_manifest}" \
+                    "${db_persistent_manifest}" "${snapshot_persistent_manifest}"
+                attempt=$(( attempt + 1 ))
+                sleep 2
+                continue
+            fi
+
+            return 1
+        fi
+
+        # Eine VM/LXC könnte genau zwischen dem letzten Online-Check und dem
+        # Stop gestartet worden sein. Im Offline-Fenster ist nur der
+        # Prozesscheck verfügbar; auch dessen eigener Fehler ist fail-closed.
+        if ! assert_no_running_guest_processes; then
+            echo "Guest-process safety gate failed during pmxcfs snapshot preparation." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        if ! pmxcfs_db_source_is_safe; then
+            echo "Quiescent pmxcfs config.db is missing, unsafe, unreadable, or empty." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        for sidecar in journal wal shm; do
+            if [[ -e "/var/lib/pve-cluster/config.db-${sidecar}" || -L "/var/lib/pve-cluster/config.db-${sidecar}" ]]; then
+                echo "SQLite sidecar remains after clean pmxcfs stop: config.db-${sidecar}" >&2
+                recover_pmxcfs_after_snapshot_failure || return 1
+                return 1
+            fi
+        done
+
+        sqlite_result="$(sqlite3 -batch -init /dev/null /var/lib/pve-cluster/config.db 'PRAGMA integrity_check;')" || {
+            echo "Could not integrity-check the quiescent live pmxcfs database." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        }
+
+        if [[ "${sqlite_result}" != "ok" ]]; then
+            echo "Quiescent live pmxcfs database failed integrity_check: ${sqlite_result}" >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        # Directly prove that the quiescent recovery database represents the
+        # same persistent static pmxcfs content as the verified PRE archive.
+        # This closes the R7 A->B->A hole: archive A versus stopped DB B cannot
+        # be accepted even if the visible POST state later returns to A.
+        if ! pmxcfs_persistent_manifest db /var/lib/pve-cluster/config.db "${db_persistent_manifest}"; then
+            echo "Could not derive the persistent static manifest from the quiescent pmxcfs database." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        if ! cmp -s "${pre_persistent_manifest}" "${db_persistent_manifest}"; then
+            echo "WARNING: Persistent static /etc/pve archive content does not match the quiescent config.db (attempt ${attempt}/${PMXCFS_SNAPSHOT_MAX_ATTEMPTS}). Retrying the complete pmxcfs snapshot..." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            rm -f -- "${TMPDEST}/config.db" "${TMPDEST}/etc-pve.tar.gz" \
+                "${pre_manifest}" "${post_manifest}" "${pre_persistent_manifest}" \
+                "${db_persistent_manifest}" "${snapshot_persistent_manifest}"
+            attempt=$(( attempt + 1 ))
+            (( attempt <= PMXCFS_SNAPSHOT_MAX_ATTEMPTS )) && sleep 2
+            continue
+        fi
+
+        if ! sqlite3 -batch -init /dev/null -cmd '.timeout 10000' \
+            /var/lib/pve-cluster/config.db \
+            ".backup '${TMPDEST}/config.db'"; then
+            echo "Could not create the quiescent pmxcfs database snapshot." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        for sidecar in journal wal shm; do
+            if [[ -e "/var/lib/pve-cluster/config.db-${sidecar}" || -L "/var/lib/pve-cluster/config.db-${sidecar}" ]]; then
+                echo "SQLite sidecar appeared during the quiescent database copy: config.db-${sidecar}" >&2
+                recover_pmxcfs_after_snapshot_failure || return 1
+                return 1
+            fi
+        done
+
+        chmod 600 "${TMPDEST}/config.db" || {
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        }
+
+        sqlite_result="$(sqlite3 -batch -init /dev/null "${TMPDEST}/config.db" 'PRAGMA integrity_check;')" || {
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        }
+
+        if [[ "${sqlite_result}" != "ok" ]]; then
+            echo "Quiescent pmxcfs database snapshot failed integrity_check: ${sqlite_result}" >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        # The copied DB must reproduce the same persistent static content as
+        # the stopped source DB before pmxcfs is allowed to restart.
+        if ! pmxcfs_persistent_manifest db "${TMPDEST}/config.db" "${snapshot_persistent_manifest}"; then
+            echo "Could not derive the persistent static manifest from the copied pmxcfs database." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+        if ! cmp -s "${db_persistent_manifest}" "${snapshot_persistent_manifest}"; then
+            echo "Copied pmxcfs database does not match the quiescent source database persistent content." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        if ! start_pmxcfs_and_validate; then
+            echo "pve-cluster did not return to a healthy state on the first restart attempt; EXIT cleanup will retry." >&2
+            return 1
+        fi
+
+        # B-10 R8: A single successful restart/health sample is not yet the end
+        # of the protected transition. Keep signal protection and recovery
+        # ownership until the POST /etc/pve view has been captured and pmxcfs
+        # has passed one final health gate after that read.
+        if ! pmxcfs_manifest_from_tree /etc/pve "${post_manifest}"; then
+            echo "Could not capture the POST /etc/pve manifest while pmxcfs was still in the protected recovery window." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        if ! pmxcfs_is_healthy; then
+            echo "pmxcfs lost health before the protected snapshot window could be closed." >&2
+            recover_pmxcfs_after_snapshot_failure || return 1
+            return 1
+        fi
+
+        PMXCFS_CRITICAL_WINDOW=0
+        critical_section_end
+
+        if cmp -s "${pre_manifest}" "${post_manifest}"; then
+            rm -f -- "${pre_manifest}" "${post_manifest}" "${pre_persistent_manifest}" \
+                "${db_persistent_manifest}" "${snapshot_persistent_manifest}"
+            echo "pmxcfs quiescent snapshot: coherent"
+            return 0
+        fi
+
+        echo "WARNING: Persistent /etc/pve content changed across the quiescent snapshot window (attempt ${attempt}/${PMXCFS_SNAPSHOT_MAX_ATTEMPTS}). Retrying the complete pmxcfs snapshot..." >&2
+        rm -f -- "${TMPDEST}/config.db" "${TMPDEST}/etc-pve.tar.gz" \
+            "${pre_manifest}" "${post_manifest}" "${pre_persistent_manifest}" \
+            "${db_persistent_manifest}" "${snapshot_persistent_manifest}"
+
+        attempt=$(( attempt + 1 ))
+        (( attempt <= PMXCFS_SNAPSHOT_MAX_ATTEMPTS )) && sleep 2
+    done
+
+    echo "ERROR: Could not obtain a coherent pmxcfs recovery snapshot after ${PMXCFS_SNAPSHOT_MAX_ATTEMPTS} attempts." >&2
+    return 1
+}
+
+
+require_archive_member() {
+    local archive="$1"
+    local source="$2"
+    local member="$3"
+
+    if [[ ! -e "${source}" && ! -L "${source}" ]]; then
+        die "Required source does not exist: ${source}"
+    fi
+
+    if ! tar -tzf "${archive}" -- "${member}" >/dev/null 2>&1; then
+        die "Required source was not backed up: ${member}"
+    fi
+}
+
+
+verify_archive_member_if_present() {
+    local archive="$1"
+    local source="$2"
+    local member="$3"
+
+    if [[ -e "${source}" || -L "${source}" ]]; then
+
+        if ! tar -tzf "${archive}" -- "${member}" >/dev/null 2>&1; then
+            die "Existing source was not backed up: ${member}"
+        fi
+
+        echo "Present and backed up: ${member}"
+
+    else
+
+        echo "Not present, skipped: ${source}"
+
+    fi
+}
+
+
+# ============================================================
+# Error handling
+# ============================================================
+
+trap cleanup EXIT
+trap error_report ERR
+
+# Ohne eigene Signal-Traps führt Bash den EXIT-Trap bei TERM/HUP/INT zwar aus,
+# aber mit $? = 0. cleanup hielt einen Abbruch dann für Erfolg und ließ das
+# unvollständige Arbeitsverzeichnis liegen (Test: SIGTERM während Schritt 5).
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+
+# ============================================================
+# Pre-flight checks
+# ============================================================
+
+if [[ "${EUID}" -ne 0 ]]; then
+    die "This script must be executed as root."
+fi
+
+
+REQUIRED_COMMANDS=(
+    sqlite3
+    tar
+    sha256sum
+    cp
+    chmod
+    chown
+    mkdir
+    mktemp
+    find
+    mv
+    rm
+    ls
+    hostname
+    readlink
+    date
+    flock
+    systemctl
+    mountpoint
+    sync
+    pveversion
+    pvesm
+    lsblk
+    findmnt
+    ip
+    ss
+    pveum
+    qm
+    pct
+    pve-firewall
+    pvesh
+    cat
+    uname
+    dpkg-query
+    timeout
+    sleep
+    sort
+    awk
+    cmp
+    pgrep
+    ps
+    xargs
+    python3
+)
+
+
+for cmd in "${REQUIRED_COMMANDS[@]}"; do
+
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        die "Required command not found: ${cmd}"
+    fi
+
+done
+
+
+if [[ ! -x /usr/sbin/sshd ]]; then
+    die "Required executable not found: /usr/sbin/sshd"
+fi
+
+
+# Jetzt erst Variablen erzeugen, deren Programme oben geprüft wurden.
+
+STAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
+NODE="$(hostname -s)"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+DEST="${BASE}/${STAMP}"
+TMPDEST="${BASE}/.${STAMP}.tmp.${BASHPID}"
+
+
+if [[ -z "${NODE}" ]]; then
+    die "Could not determine Proxmox node name."
+fi
+
+
+if [[ -z "${SELF}" || ! -f "${SELF}" ]]; then
+    die "Could not determine backup script path."
+fi
+
+
+if ! pmxcfs_db_source_is_safe; then
+    die "/var/lib/pve-cluster/config.db is not a safe readable non-empty regular database source."
+fi
+
+
+# pve-cluster muss laufen, da es pmxcfs bereitstellt.
+
+if ! systemctl is-active --quiet pve-cluster; then
+    die "pve-cluster service is not active."
+fi
+
+
+# /etc/pve darf nicht einfach nur als leeres normales Verzeichnis existieren.
+
+if ! mountpoint -q /etc/pve; then
+    die "/etc/pve is not mounted. pmxcfs is not available."
+fi
+
+
+if [[ ! -d "/etc/pve/nodes/${NODE}" ]]; then
+    die "Proxmox node directory not found: /etc/pve/nodes/${NODE}"
+fi
+
+
+# B-10 R8: Der quiescente Voll-Recovery-Snapshot ist bis zur separaten
+# Cluster- und Guest-Validierung bewusst nur auf einem Standalone-Node ohne
+# laufende VM/LXC freigegeben.
+assert_standalone_node \
+    || die "B-10 R8 quiescent pmxcfs snapshot is restricted to standalone nodes."
+
+
+PVE_CLUSTER_UNIT_STATE="$(systemctl is-enabled pve-cluster 2>/dev/null || true)"
+
+if [[ -z "${PVE_CLUSTER_UNIT_STATE}" ]]; then
+    die "Could not determine pve-cluster enable/mask state."
+fi
+
+if [[ "${PVE_CLUSTER_UNIT_STATE}" == masked* ]]; then
+    die "pve-cluster is already masked (${PVE_CLUSTER_UNIT_STATE}); refusing quiescent backup."
+fi
+
+
+assert_no_running_guests \
+    || die "B-10 R8 quiescent pmxcfs snapshot requires all VM/LXC guests to be stopped."
+
+
+# Diese Quellen sind für unseren aktuellen Host zwingend erforderlich.
+
+MANDATORY_SOURCES=(
+    /etc/pve/storage.cfg
+    /etc/pve/user.cfg
+    /etc/pve/priv/shadow.cfg
+    /etc/network/interfaces
+    /etc/ssh/sshd_config
+    /etc/passwd
+    /etc/shadow
+    /etc/group
+    /etc/hostname
+    /etc/hosts
+)
+
+
+for required_source in "${MANDATORY_SOURCES[@]}"; do
+
+    if [[ ! -e "${required_source}" && ! -L "${required_source}" ]]; then
+        die "Required configuration source missing: ${required_source}"
+    fi
+
+done
+
+
+# ============================================================
+# Lock
+# ============================================================
+
+# Verhindert zwei parallele Backupläufe.
+
+exec 9>"${LOCKFILE}"
+
+if ! flock -n 9; then
+    die "Another Proxmox configuration backup is already running."
+fi
+
+
+# ============================================================
+# Backup directory preparation
+# ============================================================
+
+# BASE darf selbst kein Symlink sein.
+
+if [[ -L "${BASE}" ]]; then
+    die "${BASE} must not be a symbolic link."
+fi
+
+
+mkdir -p "${BASE}"
+chown root:root "${BASE}"
+chmod 700 "${BASE}"
+
+
+if [[ -e "${DEST}" ]]; then
+    die "Backup destination already exists: ${DEST}"
+fi
+
+
+if [[ -e "${TMPDEST}" ]]; then
+    die "Temporary backup destination already exists: ${TMPDEST}"
+fi
+
+
+mkdir "${TMPDEST}"
+chmod 700 "${TMPDEST}"
+
+
+# ============================================================
+# Backup metadata
+# ============================================================
+
+cat > "${TMPDEST}/backup-info.txt" <<EOF
+Backup type: Proxmox VE host configuration
+Script version: ${SCRIPT_VERSION}
+Node: ${NODE}
+Started: $(date -Is)
+Final path: ${DEST}
+EOF
+
+
+chmod 600 "${TMPDEST}/backup-info.txt"
+
+
+echo "=== Proxmox configuration backup ==="
+echo
+echo "Script:      ${SCRIPT_VERSION}"
+echo "Node:        ${NODE}"
+echo "Final path:  ${DEST}"
+echo "Working dir: ${TMPDEST}"
+
+
+# ============================================================
+# 1. Coherent pmxcfs recovery snapshot
+# ============================================================
+
+echo
+echo "[1/8] Backing up coherent pmxcfs recovery state..."
+
+
+# B-10: Der bisherige Online-SQLite-Snapshot konnte bereits über /etc/pve
+# sichtbare Änderungen verpassen. Deshalb wird zuerst ein stabiler,
+# menschenlesbarer /etc/pve-Snapshot erzeugt, pmxcfs dann kurz runtime-maskiert
+# und sauber gestoppt und config.db erst im quieszenten Zustand gesichert.
+# Nach dem Neustart muss der nicht-dynamische /etc/pve-Inhalt unverändert sein.
+create_quiescent_pmxcfs_snapshot \
+    || die "Could not create a coherent quiescent pmxcfs recovery snapshot."
+
+
+# ============================================================
+# 2. pmxcfs snapshot provenance
+# ============================================================
+
+echo
+echo "[2/8] Recording pmxcfs snapshot provenance..."
+
+
+{
+    echo "pmxcfs snapshot mode: quiescent-offline"
+    echo "pmxcfs snapshot attempts: ${PMXCFS_SNAPSHOT_ATTEMPTS_USED}"
+} >> "${TMPDEST}/backup-info.txt"
+
+
+chmod 600 "${TMPDEST}/config.db" "${TMPDEST}/etc-pve.tar.gz" "${TMPDEST}/backup-info.txt"
+
+# ============================================================
+# 3. Host configuration
+# ============================================================
+
+echo
+echo "[3/8] Backing up host configuration..."
+
+
+HOST_PATHS=(
+    etc
+)
+
+
+# Proxmox Interface-Pinning kann .link-Dateien außerhalb von /etc
+# unter /usr/local/lib/systemd/network ablegen.
+
+if [[ -d /usr/local/lib/systemd/network ]]; then
+    HOST_PATHS+=(
+        usr/local/lib/systemd/network
+    )
+fi
+
+
+# Falls dort lokale systemd-Units existieren, ebenfalls sichern.
+
+if [[ -d /usr/local/lib/systemd/system ]]; then
+    HOST_PATHS+=(
+        usr/local/lib/systemd/system
+    )
+fi
+
+
+# Das lokale Restore-Werkzeug liegt außerhalb von /etc. Es wird gezielt
+# mitgesichert, ohne den Scope pauschal auf ganz /usr/local/sbin oder
+# Benutzer-Crontabs zu erweitern.
+
+if [[ -e /usr/local/sbin/pve-config-restore || -L /usr/local/sbin/pve-config-restore ]]; then
+    HOST_PATHS+=(
+        usr/local/sbin/pve-config-restore
+    )
+fi
+
+
+create_tar_archive \
+    "${TMPDEST}/etc-host.tar.gz" \
+    --acls \
+    --xattrs \
+    --numeric-owner \
+    --one-file-system \
+    --exclude='etc/pve' \
+    --exclude='etc/pve/*' \
+    -C / \
+    "${HOST_PATHS[@]}"
+
+
+chmod 600 "${TMPDEST}/etc-host.tar.gz"
+
+
+# ============================================================
+# 4. Backup script itself
+# ============================================================
+
+echo
+echo "[4/8] Backing up backup script..."
+
+
+cp -a \
+    "${SELF}" \
+    "${TMPDEST}/pve-config-backup.sh"
+
+
+chmod 700 "${TMPDEST}/pve-config-backup.sh"
+
+
+# ============================================================
+# 5. System state
+# ============================================================
+
+echo
+echo "[5/8] Saving system information..."
+
+
+{
+
+    record_info \
+        "DATE" \
+        date -Is
+
+
+    record_info \
+        "HOSTNAME" \
+        hostnamectl
+
+
+    record_info \
+        "PROXMOX VERSION" \
+        pveversion -v
+
+
+    record_info \
+        "KERNEL" \
+        uname -a
+
+
+    record_info \
+        "INSTALLED PACKAGES" \
+        dpkg-query -W '-f=${binary:Package}\t${Version}\n'
+
+
+    record_info \
+        "STORAGE" \
+        pvesm status
+
+
+    record_info \
+        "BLOCK DEVICES" \
+        lsblk -o NAME,MODEL,SERIAL,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+
+
+    record_info \
+        "FILESYSTEMS" \
+        findmnt
+
+
+    record_info \
+        "NETWORK ADDRESSES" \
+        ip -br address
+
+
+    record_info \
+        "NETWORK LINKS" \
+        ip -br link
+
+
+    record_info \
+        "IPv4 ROUTES" \
+        ip -4 route
+
+
+    record_info \
+        "IPv6 ROUTES" \
+        ip -6 route
+
+
+    record_info \
+        "NETWORK CONFIGURATION" \
+        cat /etc/network/interfaces
+
+
+    record_info \
+        "LISTENING SOCKETS" \
+        ss -lntup
+
+
+    record_info \
+        "SSH EFFECTIVE CONFIGURATION" \
+        /usr/sbin/sshd -T
+
+
+    record_info \
+        "PVE USERS" \
+        pveum user list
+
+
+    record_info \
+        "PVE ACL" \
+        pveum acl list
+
+
+    record_info \
+        "PVE REALMS" \
+        pveum realm list
+
+
+    record_info \
+        "VIRTUAL MACHINES" \
+        qm list
+
+
+    record_info \
+        "LXC CONTAINERS" \
+        pct list
+
+
+    record_info \
+        "PVE FIREWALL STATUS" \
+        pve-firewall status
+
+
+    record_info \
+        "PROXMOX NFTABLES FIREWALL STATUS" \
+        systemctl status proxmox-firewall --no-pager -l
+
+
+    record_info \
+        "DATACENTER FIREWALL OPTIONS" \
+        pvesh get /cluster/firewall/options --output-format yaml
+
+
+    record_info \
+        "NODE FIREWALL OPTIONS" \
+        pvesh get "/nodes/${NODE}/firewall/options" --output-format yaml
+
+
+    record_info \
+        "FAILED SERVICES" \
+        systemctl --failed --no-pager
+
+
+} > "${TMPDEST}/system-state.txt" 2>&1
+
+
+chmod 600 "${TMPDEST}/system-state.txt"
+
+
+# ============================================================
+# 6. Checksums
+# ============================================================
+
+echo
+echo "[6/8] Creating checksums..."
+
+
+(
+    cd "${TMPDEST}"
+
+    sha256sum \
+        backup-info.txt \
+        config.db \
+        etc-pve.tar.gz \
+        etc-host.tar.gz \
+        pve-config-backup.sh \
+        system-state.txt \
+        > SHA256SUMS
+)
+
+
+chmod 600 "${TMPDEST}/SHA256SUMS"
+
+
+# ============================================================
+# 7. Verification
+# ============================================================
+
+echo
+echo "[7/8] Verifying backup..."
+
+
+# ------------------------------------------------------------
+# Dateien müssen existieren und dürfen nicht leer sein
+# ------------------------------------------------------------
+
+for file in \
+    backup-info.txt \
+    config.db \
+    etc-pve.tar.gz \
+    etc-host.tar.gz \
+    pve-config-backup.sh \
+    system-state.txt \
+    SHA256SUMS
+
+do
+
+    if [[ ! -s "${TMPDEST}/${file}" ]]; then
+        die "Backup file missing or empty: ${file}"
+    fi
+
+done
+
+
+# ------------------------------------------------------------
+# SHA-256
+# ------------------------------------------------------------
+
+echo
+echo "Checking SHA-256 checksums..."
+
+
+(
+    cd "${TMPDEST}"
+    sha256sum -c SHA256SUMS
+)
+
+
+# ------------------------------------------------------------
+# SQLite
+# ------------------------------------------------------------
+
+echo
+echo "Checking pmxcfs SQLite database..."
+
+
+SQLITE_RESULT="$(
+    sqlite3 -batch -init /dev/null \
+        "${TMPDEST}/config.db" \
+        'PRAGMA integrity_check;'
+)"
+
+
+if [[ "${SQLITE_RESULT}" != "ok" ]]; then
+
+    echo
+    echo "SQLite integrity check returned:"
+    echo "${SQLITE_RESULT}"
+
+    die "pmxcfs database integrity check failed."
+
+fi
+
+
+echo "config.db: SQLite integrity OK"
+
+
+# ------------------------------------------------------------
+# TAR integrity
+# ------------------------------------------------------------
+
+echo
+echo "Checking etc-pve archive..."
+
+
+tar -tzf \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    >/dev/null
+
+
+echo "etc-pve.tar.gz: archive OK"
+
+
+echo
+echo "Checking host configuration archive..."
+
+
+tar -tzf \
+    "${TMPDEST}/etc-host.tar.gz" \
+    >/dev/null
+
+
+echo "etc-host.tar.gz: archive OK"
+
+
+# ------------------------------------------------------------
+# Mandatory Proxmox configuration
+# ------------------------------------------------------------
+
+echo
+echo "Checking mandatory Proxmox configuration files..."
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/storage.cfg" \
+    "etc/pve/storage.cfg"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/user.cfg" \
+    "etc/pve/user.cfg"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/priv/shadow.cfg" \
+    "etc/pve/priv/shadow.cfg"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/authkey.pub" \
+    "etc/pve/authkey.pub"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/priv/authkey.key" \
+    "etc/pve/priv/authkey.key"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/pve-www.key" \
+    "etc/pve/pve-www.key"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/pve-root-ca.pem" \
+    "etc/pve/pve-root-ca.pem"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/priv/pve-root-ca.key" \
+    "etc/pve/priv/pve-root-ca.key"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/nodes/${NODE}/pve-ssl.pem" \
+    "etc/pve/nodes/${NODE}/pve-ssl.pem"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/nodes/${NODE}/pve-ssl.key" \
+    "etc/pve/nodes/${NODE}/pve-ssl.key"
+
+
+echo "Mandatory Proxmox configuration files: OK"
+
+
+# ------------------------------------------------------------
+# Optional/current Proxmox configuration
+# ------------------------------------------------------------
+
+echo
+echo "Checking current optional Proxmox files..."
+
+
+verify_archive_member_if_present \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/datacenter.cfg" \
+    "etc/pve/datacenter.cfg"
+
+
+verify_archive_member_if_present \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/firewall/cluster.fw" \
+    "etc/pve/firewall/cluster.fw"
+
+
+verify_archive_member_if_present \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/nodes/${NODE}/host.fw" \
+    "etc/pve/nodes/${NODE}/host.fw"
+
+
+verify_archive_member_if_present \
+    "${TMPDEST}/etc-pve.tar.gz" \
+    "/etc/pve/priv/authorized_keys" \
+    "etc/pve/priv/authorized_keys"
+
+
+# ------------------------------------------------------------
+# Mandatory Debian host configuration
+# ------------------------------------------------------------
+
+echo
+echo "Checking mandatory host configuration files..."
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/network/interfaces" \
+    "etc/network/interfaces"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/ssh/sshd_config" \
+    "etc/ssh/sshd_config"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/hostname" \
+    "etc/hostname"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/hosts" \
+    "etc/hosts"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/passwd" \
+    "etc/passwd"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/shadow" \
+    "etc/shadow"
+
+
+require_archive_member \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/group" \
+    "etc/group"
+
+
+echo "Mandatory host configuration files: OK"
+
+
+# ------------------------------------------------------------
+# Current SSH override
+# ------------------------------------------------------------
+
+echo
+echo "Checking current SSH override file..."
+
+
+verify_archive_member_if_present \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/etc/ssh/sshd_config.d/00-local-admin.conf" \
+    "etc/ssh/sshd_config.d/00-local-admin.conf"
+
+
+# ------------------------------------------------------------
+# Local Proxmox/systemd network pinning
+# ------------------------------------------------------------
+
+if [[ -d /usr/local/lib/systemd/network ]]; then
+
+    echo
+    echo "Checking local systemd network configuration..."
+
+    require_archive_member \
+        "${TMPDEST}/etc-host.tar.gz" \
+        "/usr/local/lib/systemd/network" \
+        "usr/local/lib/systemd/network"
+
+    echo "Local systemd network configuration: OK"
+
+fi
+
+
+# ------------------------------------------------------------
+# Local systemd units
+# ------------------------------------------------------------
+
+if [[ -d /usr/local/lib/systemd/system ]]; then
+
+    echo
+    echo "Checking local systemd unit configuration..."
+
+    require_archive_member \
+        "${TMPDEST}/etc-host.tar.gz" \
+        "/usr/local/lib/systemd/system" \
+        "usr/local/lib/systemd/system"
+
+    echo "Local systemd unit configuration: OK"
+
+fi
+
+
+# ------------------------------------------------------------
+# Local recovery tool
+# ------------------------------------------------------------
+
+echo
+echo "Checking local recovery tool..."
+
+
+verify_archive_member_if_present \
+    "${TMPDEST}/etc-host.tar.gz" \
+    "/usr/local/sbin/pve-config-restore" \
+    "usr/local/sbin/pve-config-restore"
+
+
+# ------------------------------------------------------------
+# Verification marker
+# ------------------------------------------------------------
+
+{
+    echo "PROXMOX CONFIGURATION BACKUP VERIFIED"
+    echo "Script version: ${SCRIPT_VERSION}"
+    echo "Node: ${NODE}"
+    echo "Created: $(date -Is)"
+    echo "Status: OK"
+
+} > "${TMPDEST}/VERIFIED"
+
+
+chmod 600 "${TMPDEST}/VERIFIED"
+
+
+# ============================================================
+# 8. Finalize and retention
+# ============================================================
+
+echo
+echo "[8/8] Finalizing backup..."
+
+
+# Inhalt zuerst dauerhaft schreiben. Sonst kann nach einem Stromausfall ein
+# Ordner mit finalem Namen und VERIFIED existieren, dessen Dateien leer sind.
+
+sync -f "${TMPDEST}"
+
+
+# Erst jetzt erhält der Ordner seinen endgültigen Namen.
+
+mv -- \
+    "${TMPDEST}" \
+    "${DEST}"
+
+
+# Ab jetzt darf cleanup den finalen Ordner nicht entfernen.
+
+TMPDEST=""
+
+
+# Daten auf das Dateisystem schreiben, bevor Erfolg gemeldet wird.
+
+sync -f "${DEST}"
+
+
+echo
+echo "Removing VERIFIED backup directories older than ${RETENTION_DAYS} days..."
+echo "The newest ${RETENTION_MIN_KEEP} VERIFIED backups are always kept."
+
+
+RETENTION_FAILED=0
+
+
+# Die neuesten verifizierten Backups (Name = Zeitstempel, daher sortierbar)
+# sind unabhängig vom Alter geschützt. Schützt gegen Totalverlust, wenn der
+# Timer lange ausgefallen war oder die Systemzeit falsch vorläuft.
+
+declare -A KEEP_NEWEST=()
+
+while IFS= read -r keep_name; do
+
+    if [[ -n "${keep_name}" ]]; then
+        KEEP_NEWEST["${keep_name}"]=1
+    fi
+
+done < <(
+    find "${BASE}" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -name '????-??-??_??-??-??' \
+        -exec test -f '{}/VERIFIED' ';' \
+        -printf '%f\n' \
+    | sort -r \
+    | awk -v n="${RETENTION_MIN_KEEP}" 'NR <= n'
+)
+
+
+while IFS= read -r -d '' old_backup; do
+
+    if [[ -n "${KEEP_NEWEST[${old_backup##*/}]:-}" ]]; then
+
+        echo "Keeping (one of the newest ${RETENTION_MIN_KEEP}): ${old_backup}"
+        continue
+
+    fi
+
+    if [[ -f "${old_backup}/VERIFIED" ]]; then
+
+        if ! rm -rf -- "${old_backup}"; then
+
+            echo \
+                "WARNING: Could not remove old backup: ${old_backup}" \
+                >&2
+
+            RETENTION_FAILED=1
+
+        fi
+
+    else
+
+        echo \
+            "Skipping old unverified directory: ${old_backup}" \
+            >&2
+
+    fi
+
+done < <(
+    find "${BASE}" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -name '????-??-??_??-??-??' \
+        -mmin "+$(( RETENTION_DAYS * 24 * 60 ))" \
+        -print0
+)
+
+
+# Unvollständige Arbeitsverzeichnisse (SIGKILL, Stromausfall, Absturz) werden
+# nie finalisiert und passen nicht auf das Muster oben. Der Lock garantiert,
+# dass kein anderer Backup-Lauf sie gerade benutzt.
+
+while IFS= read -r -d '' stale_tmp; do
+
+    echo "Removing stale incomplete working directory: ${stale_tmp}" >&2
+
+    if ! rm -rf -- "${stale_tmp}"; then
+
+        echo \
+            "WARNING: Could not remove stale working directory: ${stale_tmp}" \
+            >&2
+
+        RETENTION_FAILED=1
+
+    fi
+
+done < <(
+    find "${BASE}" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -name '.????-??-??_??-??-??.tmp.*' \
+        -mmin +1440 \
+        -print0
+)
+
+
+if (( RETENTION_FAILED != 0 )); then
+
+    echo \
+        "WARNING: Backup is valid, but one or more old backups or stale working directories could not be removed." \
+        >&2
+
+fi
+
+
+echo
+echo "============================================================"
+echo " BACKUP COMPLETED AND VERIFIED SUCCESSFULLY"
+echo "============================================================"
+echo
+echo "Backup:"
+echo "${DEST}"
+echo
+echo "Contents:"
+
+
+ls -lah "${DEST}" || true
