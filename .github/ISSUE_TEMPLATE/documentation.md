@@ -1,6 +1,6 @@
 ---
 name: Documentation issue
-description: Report documentation gaps or inconsistent instructions without private host data
+about: Report documentation gaps or inconsistent instructions without private host data
 labels: documentation
 ---
 

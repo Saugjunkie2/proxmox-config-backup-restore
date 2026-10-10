@@ -1,5 +1,14 @@
 # Publication changelog
 
+## Full development history (extracted from the frozen scripts)
+
+- **[Backup development history — 1.3 through 1.6](docs/history/backup.md):** all 12 source revision headings and 30 change bullets, translated into English from the original German comments.
+- **[Restore development history — 1.4 through 1.14](docs/history/restore.md):** all 22 source revision headings and 115 change bullets, with the original revision labels retained.
+
+The histories above are reconstructed *from the immutable published script headers*. They are **not** separate historical Git commits, do **not** imply that every intermediate draft was separately released, and do **not** assert that tests mentioned by the original authors were independently repeated during GitHub packaging. The source headers are the authoritative record of their original wording.
+
+---
+
 ## 2026-10-10 — Initial repository package
 
 Repository: `proxmox-config-backup-restore`. Publisher: [@Saugjunkie2](https://github.com/Saugjunkie2). GitHub publication date, once completed, is recorded separately through Git commits and Releases.

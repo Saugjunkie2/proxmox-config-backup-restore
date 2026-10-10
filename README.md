@@ -16,7 +16,7 @@
 - **Consistent `pmxcfs` snapshots:** the backup process checks guest activity, temporarily quiesces `pve-cluster`, captures `config.db`, then checks service recovery and backup integrity.
 - **Targeted recovery:** use the interactive restore menu to recover a specific configuration domain rather than immediately reverting the entire Proxmox configuration database.
 - **Explicit integrity records:** each completed backup set contains a SHA-256 manifest, SQLite integrity checks, archive checks and a `VERIFIED` marker; read the [limits of these checks](docs/backup-format.md).
-- **Preserved source history:** the publication keeps both original scripts byte-for-byte, including historical development notes, while providing new English documentation and reproducible source checksums.
+- **Preserved source history:** the publication keeps both original scripts byte-for-byte, including historical development notes, while providing new English documentation and reproducible source checksums. The complete extracted [Backup revision history](docs/history/backup.md) and [Restore revision history](docs/history/restore.md) are available separately.
 
 These are design characteristics from the shipped source, **not** a claim of independent security certification or broad compatibility. See [known caveats](docs/security-model.md#known-source-level-caveats).
 
@@ -115,6 +115,9 @@ A successful timer trigger is **not** proof of a successful backup. Running gues
 
 | Guide | Purpose |
 | --- | --- |
+| [Detailed version history](CHANGELOG.md) | Publication notes and links to both full source development histories |
+| [Backup development history](docs/history/backup.md) | All 12 historical backup revision headings and 30 change bullets in English |
+| [Restore development history](docs/history/restore.md) | All 22 historical restore revision headings and 115 change bullets |
 | [Installation](docs/installation.md) | Prerequisites, local install, verification, optional scheduling, uninstall |
 | [Architecture](docs/architecture.md) | Interactions among scripts, `pmxcfs`, filesystem and systemd |
 | [Backup format](docs/backup-format.md) | Exact backup-set files, scopes, retention, checks |
