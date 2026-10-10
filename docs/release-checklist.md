@@ -2,7 +2,9 @@
 
 [← README](../README.md) · [Source provenance](source-provenance.md)
 
-This checklist validates a **documentation-and-packaging release**, not a new functional software release or host security audit.
+**Historical pre-publication worksheet (2026-10-10):** The repository and initial GitHub Release are now public. The unchecked items below are retained as the **original pending/undocumented approvals**; do not interpret them as newly completed or silently check them. In particular, copyright and third-party licensing rights remain for the publisher to verify independently. The completed GitHub integrity workflow verifies script bytes, not Proxmox runtime behavior.
+
+This checklist originally guided a **documentation-and-packaging release**, not a new functional software release or host security audit.
 
 ## Mandatory ownership and legal decisions
 

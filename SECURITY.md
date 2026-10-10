@@ -6,7 +6,7 @@ These scripts operate with root privileges and manipulate sensitive Proxmox conf
 
 ## Reporting
 
-**Do not disclose secrets, password hashes, private keys, complete backups or unredacted host logs in public GitHub issues.** When a GitHub repository is published, the owner should enable GitHub Private Vulnerability Reporting (if available) and add an approved contact channel here. **No reporting address has been supplied yet**; do not invent one.
+**Do not disclose secrets, password hashes, private keys, complete backups or unredacted host logs in public GitHub issues.** This repository is now public. The owner should enable [GitHub Private Vulnerability Reporting](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configure-for-a-repository) and then document its availability here. A private reporting channel has **not been independently verified as enabled**, and no dedicated contact address has been supplied; do not submit sensitive material through public issues.
 
 Reports should describe the code version and affected feature, a minimal **synthetic** reproduction, expected vs observed behavior, and any constraints of the test environment. Label claims as source analysis, simulation, external logs, or confirmed real-host tests.
 

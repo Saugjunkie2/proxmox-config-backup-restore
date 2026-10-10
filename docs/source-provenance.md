@@ -23,4 +23,4 @@ A separate legacy German-language installation transcript was reviewed to unders
 
 ## Verification discipline
 
-File identity is reproducible by `sha256sum -c SHA256SUMS` or `sha256sum scripts/...`. This checks **identity only**, not operational safety. Existing field tests, earlier external review assertions and current repository packaging must never be conflated.
+File identity is reproducible by `sha256sum -c SHA256SUMS` or `sha256sum scripts/...`. The GitHub source-integrity workflow also checks the files against **pinned original SHA-256 values**, separately from the repository manifest. These checks detect accidental source modifications but do **not** establish independent authenticity if someone with write access changes both workflow and source; use GitHub branch protections/rulesets for additional change control. They do **not** prove operational safety. Existing field tests, earlier external review assertions and current repository packaging must never be conflated.

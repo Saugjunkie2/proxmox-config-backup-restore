@@ -28,11 +28,15 @@ These two packages alone do not guarantee every mode's prerequisites.
 
 ## 3. Obtain and verify the release
 
-Clone or extract the published release *after* its GitHub location is known. Avoid piping downloaded shell scripts directly into a root shell. In a local checked-out project root:
+Obtain the project from the [public GitHub repository](https://github.com/Saugjunkie2/proxmox-config-backup-restore). Avoid piping downloaded shell scripts directly into a root shell. For a **fresh** checkout on a host where `git` is installed:
 
 ```bash
+git clone https://github.com/Saugjunkie2/proxmox-config-backup-restore.git
+cd proxmox-config-backup-restore
 sha256sum -c SHA256SUMS
 ```
+
+Alternatively download and extract a GitHub source archive, change into its extracted root, then run `sha256sum -c SHA256SUMS`. The `bundle-2026.10` release tag preserves the **initial publication**; `main` includes later documentation-only commits such as the extracted development histories. Both carry the frozen script bytes.
 
 Expected result: both `scripts/` files should print `OK`. Compare hashes with a trusted release announcement; a manifest downloaded from the same untrusted location is not independent authenticity proof.
 

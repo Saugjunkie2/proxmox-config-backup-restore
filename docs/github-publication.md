@@ -2,7 +2,9 @@
 
 [← README](../README.md) · [Release checklist](release-checklist.md)
 
-This guide is repository **metadata and publication guidance**. It does not create a GitHub repository, run the scripts, or modify the frozen source files.
+**Historical first-publication guide:** This repository is **already public**, and its first bundle was released as [`bundle-2026.10`](https://github.com/Saugjunkie2/proxmox-config-backup-restore/releases/tag/bundle-2026.10). The steps below describe the original setup process; **do not run `git init`, add `origin`, or create the repository again inside an existing checkout**. For documentation updates, use the existing Git checkout and normal commit/push workflow.
+
+This guide records repository **metadata and original publication guidance**. It does not run the scripts or modify frozen source files.
 
 ## Recommended repository identity
 

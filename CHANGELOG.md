@@ -11,7 +11,7 @@ The histories above are reconstructed *from the immutable published script heade
 
 ## 2026-10-10 — Initial repository package
 
-Repository: `proxmox-config-backup-restore`. Publisher: [@Saugjunkie2](https://github.com/Saugjunkie2). GitHub publication date, once completed, is recorded separately through Git commits and Releases.
+Repository: `proxmox-config-backup-restore`. Publisher: [@Saugjunkie2](https://github.com/Saugjunkie2). The initial public release was published on 2026-10-10 as [`bundle-2026.10`](https://github.com/Saugjunkie2/proxmox-config-backup-restore/releases/tag/bundle-2026.10). Later documentation commits on `main` do not retroactively change that tagged source snapshot.
 
 - Placed unchanged `pve-config-backup` version 1.6 and `pve-config-restore` version 1.14 in `scripts/`.
 - Added English documentation: architecture, installation, operations, backup format, restore modes, recovery runbook, compatibility, security and limitations.
